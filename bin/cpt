@@ -1,0 +1,315 @@
+#!./env/bin/python
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+import json
+from os import chdir, getcwd
+from typing import IO, Optional, Tuple, cast
+import subprocess
+import sys
+from colorama import Fore, Back, Style
+
+BIN_BASE_PATH = Path(__file__).parent
+
+@dataclass
+class Config:
+    base_path: str
+    filename: str
+    debug: bool
+    input_file: str
+    output_file: str
+
+    def to_dict(self) -> dict:
+        return {
+            'base_path': self.base_path,
+            'filename': self.filename,
+            'debug': self.debug,
+            'input_file': self.input_file,
+            'output_file': self.output_file,
+        }
+    
+    @staticmethod
+    def from_dict(data: dict) -> 'Config':
+        return Config(
+            base_path=data['base_path'],
+            filename=data['filename'],
+            debug=data['debug'],
+            input_file=data['input_file'],
+            output_file=data['output_file'],
+        )
+
+
+def load_config(file_path: Path, config_file: str, config: Config) -> Config:
+    path = Path(config_file)
+    temp_path = file_path.as_posix()
+    if not path.exists():
+        with open(config_file, 'w') as f:
+            json.dump({
+                temp_path: config.to_dict()
+            }, f)
+        return config
+    else:
+        with open(config_file, 'r') as f:
+            data = json.load(f)
+            temp_conf: Optional[Config] = None
+            if temp_path in data:
+                temp_conf = Config.from_dict(data[temp_path])
+                temp_conf.input_file = config.input_file
+                temp_conf.output_file = config.output_file
+                temp_conf.debug = config.debug
+            else:
+                data[temp_path] = config.to_dict()
+                temp_conf = config
+
+            with open(config_file, 'w') as f:
+                json.dump(data, f)
+            
+            return temp_conf
+
+
+def init_build(compile_path: str) -> None:
+    path = Path(compile_path)
+    if not path.exists():
+        path.mkdir()
+
+def build_config(base_path: str, args: argparse.Namespace) -> Config:
+    filename_path = Path(args.filename)
+    filename = filename_path.name
+    filepath = Path(base_path, filename)
+    input_file = args.input if args.input is not None else filepath.stem + '.in'
+    output_file = args.output if args.output is not None else filepath.stem + '.out'
+    return Config(
+        base_path=getcwd(),
+        filename=args.filename,
+        debug=args.debug,
+        input_file=input_file,
+        output_file=output_file,
+    )
+
+def generate_source_file(file_path: Path, _config: Config, _args: argparse.Namespace) -> None:
+    if file_path.exists():
+        return
+
+    cp_path = BIN_BASE_PATH / 'template.cpp'
+    with open(cp_path, 'r') as f:
+        data = f.read()
+        print(data, file=open(file_path, 'w'))
+
+@dataclass
+class MatchTestResult:
+    error: Optional[Tuple[str, int, int]]
+    expected: str
+    out_string: str
+
+def match_test_output(expected: str, out_string: str, min_show_chars: int) -> MatchTestResult:
+    max_program_output_chars = min(min_show_chars, len(out_string))
+    max_expected_output_chars = min(min_show_chars, len(expected))
+    view_expected = expected[0: max_expected_output_chars] + ('...' if max_expected_output_chars < len(expected) else '')
+    view_out_string = out_string[0: max_program_output_chars] + ('...' if max_program_output_chars < len(out_string) else '')
+    
+    if len(expected) != len(out_string):
+        return MatchTestResult((f"Length mismatch; expected {len(expected)}, but got {len(out_string)}", 0, max_program_output_chars), view_expected, view_out_string)
+    
+    for idx in range(0, len(expected)):
+        if expected[idx] != out_string[idx]:
+            start = max(0, idx - max((max_program_output_chars // 2), 4))
+            end = min(len(out_string), idx + max((max_program_output_chars // 2), 4))
+            view_out_string = out_string[start: end] + ('...' if end < len(out_string) else '')
+            
+            start = max(0, idx - max((max_expected_output_chars // 2), 4))
+            end = min(len(expected), idx + max((max_expected_output_chars // 2), 4))
+            view_expected = expected[start: end] + ('...' if end < len(expected) else '')
+
+            return MatchTestResult((f"Character mismatch; expected {expected[idx]}, but got {out_string[idx]}", max(idx - 1, 0), idx + 1), view_expected, view_out_string)
+    
+    return MatchTestResult(None, view_expected, view_out_string)
+
+def test_program(output_file: Path, out_string: str, args: argparse.Namespace) -> bool:
+    outlines = out_string.strip().split('\n') if not args.whitespace_sensitive_test else out_string.split('\n')
+
+    with open(output_file, 'r') as f:
+        expected = f.read().strip() if not args.whitespace_sensitive_test else f.read()
+        file_lines = list(map(lambda s: s.strip(), expected.split('\n'))) if not args.whitespace_sensitive_test else expected.split('\n')
+        out_lines = list(map(lambda s: s.strip(), outlines)) if not args.whitespace_sensitive_test else outlines
+
+        if len(out_lines) != len(file_lines):
+            print(f'{Fore.RED}{Style.BRIGHT}Test failed{Style.RESET_ALL}: number of lines does not match; expected {len(file_lines)} got {len(out_lines)}', file=sys.stderr)
+            return False
+        
+        total_passed = 0
+        total_tests = len(file_lines)
+        for idx, (expected, out_string) in enumerate(zip(file_lines, out_lines)):
+            res = match_test_output(expected, out_string, args.show_chars)
+            if res.error is None:
+                total_passed += 1
+                print(f'{Fore.GREEN}{Style.BRIGHT}{idx + 1}. Test passed{Style.RESET_ALL} => Expected("{Fore.BLUE}{Style.BRIGHT}{res.expected}{Style.RESET_ALL}") == Program("{Fore.BLUE}{Style.BRIGHT}{res.out_string}{Style.RESET_ALL}")', file=sys.stderr)
+            else:
+                message = res.error[0]
+                start_span = res.error[1]
+                end_span = res.error[2]
+                print(f'{Fore.RED}{Style.BRIGHT}{idx + 1}. Test failed{Style.RESET_ALL}: {message}', file=sys.stderr)
+                
+                left_out = res.expected[0: start_span]
+                err_out = res.expected[start_span: end_span]
+                right_out = res.expected[end_span: len(res.expected)]
+                print(f'   - Expected: "{left_out}{Fore.RED}{Style.BRIGHT}{err_out}{Style.RESET_ALL}{right_out}"', file=sys.stderr)
+                
+                
+                left_out = res.out_string[0: start_span]
+                err_out = res.out_string[start_span: end_span]
+                right_out = res.out_string[end_span: len(res.out_string)]
+                print(f'   - Program:  "{left_out}{Fore.RED}{Style.BRIGHT}{err_out}{Style.RESET_ALL}{right_out}"', file=sys.stderr)
+                break
+            
+        print(f'\nTotal {Fore.GREEN}{Style.BRIGHT}{total_passed}/{total_tests}{Style.RESET_ALL} passed', end='')
+        if total_tests != total_passed:
+            print(f', but {Fore.RED}{Style.BRIGHT}1{Style.RESET_ALL} failed and {Fore.YELLOW}{Style.BRIGHT}{total_tests - total_passed - 1}{Style.RESET_ALL} skipped.', end='')
+            return False
+        print()
+    return True
+
+def compile_program(config: Config, args: argparse.Namespace) -> None:
+    base_path = Path(config.base_path)
+    output_dir = Path(args.compile_path)
+    
+    file_path = base_path / str(args.filename)
+    if file_path.suffix != '.cpp':
+        file_path = file_path.with_suffix('.cpp')
+    file_stem = file_path.stem
+    
+    bin_output = output_dir / f'{file_stem}.out'
+    source_parent = file_path.parent
+
+    if not source_parent.exists():
+        source_parent.mkdir(parents=True, exist_ok=True)
+    
+    output_file = source_parent / config.output_file
+    input_file = source_parent / config.input_file
+
+    if output_file.exists() and args.generate_output:
+        raise FileExistsError(f'File {output_file} already exists')
+    
+    if input_file.exists() and args.generate_input:
+        raise FileExistsError(f'File {input_file} already exists')
+    
+    if args.generate_output:
+        output_file.touch()
+    
+    if args.generate_input:
+        input_file.touch()
+
+    generate_source_file(file_path, config, args)
+
+    print('Generated source file...', file=sys.stderr)
+
+    if args.just_generate:
+        return
+
+    compile_flag = [f for f in [
+        str(file_path),
+        f'-I{BIN_BASE_PATH / "include"}',
+        '-g' if config.debug else '',
+        '-Wall',
+        '-Wextra',
+        '-Werror',
+        '-pedantic',
+        '-pedantic-errors',
+        '-std=c++17',
+        '-Wno-gnu-zero-variadic-macro-arguments',
+        '-Wshadow',
+        '-fsanitize=address' if config.debug else ''
+        '-fno-omit-frame-pointer' if config.debug else ''
+        '-O0' if config.debug else '-O3',
+        '-DDEBUG' if config.debug else '',
+        f'-DFILE_IN="{input_file}"' if input_file.exists() else '',
+        f'-DFILE_OUT="{output_file}"' if output_file.exists() else '',
+        '-o',
+        str(bin_output)
+    ] if f != '']
+
+    cwd = getcwd()
+    change_dir = Path(cwd) != source_parent
+    if change_dir:
+        print(f'Changing directory to {source_parent}', file=sys.stderr)
+        chdir(source_parent)
+    
+    try:
+        if not args.run or args.force_run:
+            cmd = subprocess.Popen(['g++', *compile_flag], stdout=sys.stdout, stderr=sys.stderr)
+            cmd.wait()
+            if (cmd.returncode != 0):
+                print('Compilation failed', file=sys.stderr)
+                return
+            print('Compiled source file...', file=sys.stderr)
+
+            if args.just_compile:
+                return
+        
+        process = subprocess.Popen([str(bin_output)], stdout=subprocess.PIPE, stderr=sys.stderr)
+        stdout = cast(IO[bytes], process.stdout)
+        
+        if stdout is None:
+            return
+
+        is_test_enabled = args.test or args.whitespace_sensitive_test
+        out_string = ''
+        for c in iter(lambda: stdout.read(1), b''):
+            out_string += c.decode('utf-8')
+            if not is_test_enabled:
+                sys.stdout.buffer.write(c)
+                sys.stdout.flush()
+
+        
+        
+        if is_test_enabled:
+            if not output_file.exists():
+                raise FileExistsError(f'File {output_file} does not exist')
+            if not test_program(output_file, out_string, args):
+                return
+
+    finally:
+        if change_dir:
+            print(f'Changing directory back to {cwd}', file=sys.stderr)
+            chdir(cwd)
+            
+    
+
+
+def handle_args(args: argparse.Namespace) -> None:
+    base_path = getcwd()
+    filepath = Path(base_path, args.filename)
+    if filepath.exists() and not args.force:
+        raise FileExistsError(f'File {args.filename} already exists')
+
+    init_build(args.compile_path)
+    config = build_config(base_path, args)
+    config = load_config(filepath, args.config, config)
+
+    compile_program(config, args)
+
+def main() -> None:
+    base_path = getcwd()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-n', '--filename', required=True, help='name of the file to create', type=str)
+    parser.add_argument('-jg', '--just-generate', help='generate the file', action='store_true')
+    parser.add_argument('-jc', '--just-compile', help='compile the file', action='store_true')
+    parser.add_argument('-r', '--run', help='run the file', action='store_true')
+    parser.add_argument('-fr', '--force-run', help='compile and run the file', action='store_false')
+    parser.add_argument('-conf', '--config', help='config file name', default='./build/config.json')
+    parser.add_argument('-d', '--debug', help='debug mode', action='store_true')
+    parser.add_argument('-in', '--input', help='input file name')
+    parser.add_argument('-out', '--output', help='output file name')
+    parser.add_argument('-cp', '--compile-path', help='path to the compile folder', type=str, default=f'{base_path}/build')
+    parser.add_argument('-f', '--force', help='force overwrite', action='store_true')
+    parser.add_argument('-gin', '--generate-input', help='generate input file', action='store_true')
+    parser.add_argument('-gout', '--generate-output', help='generate output file', action='store_true')
+    parser.add_argument('-t', '--test', help='test the program', action='store_true')
+    parser.add_argument('-st', '--whitespace-sensitive-test', help='test the program with whitespace', action='store_true')
+    parser.add_argument('--show-chars', help='show n chars when test passes or fails', default=20, type=int)
+
+    args = parser.parse_args()
+    handle_args(args)
+
+if __name__ == '__main__':
+    main()
